@@ -44,5 +44,26 @@ fn upload_data(data: [f32]) -> Result<GpuPtr, GpuError>:
 
 ## Run
 ```bash
-bin/simple examples/simple_cuda_example/10.cuda_basic/16.Error_Handling/main.spl
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/16.Error_Handling/main.spl
+```
+
+## Try it (verified doctest)
+`GpuError` is a plain struct, so the wrapping pattern works without a device;
+`Result` values are matched, never unwrapped:
+
+```sdoctest
+>>> use std.gpu.*
+>>> fn need_devices(count: i64) -> Result<i64, GpuError>:
+...     if count <= 0:
+...         return Err(GpuError(code: -1, message: "No GPU devices found"))
+...     Ok(count)
+>>> match need_devices(0):
+...     case Ok(n): print "ok {n}"
+...     case Err(e): print "error: {e.message}"
+error: No GPU devices found
+>>> match need_devices(2):
+...     case Ok(n): print "ok {n}"
+...     case Err(e): print "error: {e.message}"
+ok 2
+>>> if need_devices(0).is_ok() or need_devices(2).is_err(): panic("Result mapping is wrong")
 ```

@@ -1,125 +1,93 @@
-# Exercise 23: Shared Memory Reduction - Tests
-
-use std.gpu.{GpuError}
+# Exercise 23: Shared Memory - Tests
+#
+# All three reduction kernels must agree with the CPU sum, including for
+# sizes that are not a multiple of the block size (tail handling) and for
+# the optimized kernel's 2*BLOCK_SIZE elements per block.
 
 use self.main.{
-    make_data, make_sequential, cpu_sum,
-    run_reduce_naive, run_reduce_sequential, run_reduce_optimized,
-    BLOCK_SIZE
+    PTX, BLOCK_SIZE, make_data, make_sequential, cpu_sum,
+    run_reduce_naive, run_reduce_sequential, run_reduce_optimized
 }
-
-fn approx_eq(a: f32, b: f32, tol: f32) -> bool:
-    val diff = a - b
-    diff < tol and diff > (0.0f32 - tol)
+use gpu_test_helpers.{gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload, close_enough}
 
 describe "Shared Memory Reduction":
 
-    describe "naive interleaved":
+    describe "CPU references":
 
-        it "sums 256 ones (single block)":
-            val data = make_data(256, 1.0f32)
-            val result = run_reduce_naive(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 256.0f32, 1.0f32)).to_equal(true)
+        it "cpu_sum of the sequence 0..99 is 4950":
+            expect(close_enough(cpu_sum(make_sequential(100)), 4950.0, 0.001)).to_equal(true)
 
-        it "sums 1024 ones (multiple blocks)":
-            val data = make_data(1024, 1.0f32)
-            val result = run_reduce_naive(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 1024.0f32, 1.0f32)).to_equal(true)
+        it "block size is a power of two so halving loops terminate at 1":
+            var s = BLOCK_SIZE
+            var steps = 0
+            while s > 1:
+                s = s / 2
+                steps = steps + 1
+            expect(s).to_equal(1)
+            expect(steps).to_equal(8)
 
-        it "sums sequential values":
-            val n = 512
-            val data = make_sequential(n)
-            val expected = cpu_sum(data)
-            val result = run_reduce_naive(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), expected, 1.0f32)).to_equal(true)
+    describe "device reductions":
 
-    describe "sequential addressing":
+        it "reduce_naive sums 1024 ones":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(close_enough(run_reduce_naive(module, make_data(1024, 1.0)).unwrap(), 1024.0, 0.01)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "sums 256 ones (single block)":
-            val data = make_data(256, 1.0f32)
-            val result = run_reduce_sequential(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 256.0f32, 1.0f32)).to_equal(true)
+        it "reduce_sequential handles a size that is not a block multiple":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential(1000)
+            expect(close_enough(run_reduce_sequential(module, data).unwrap(), cpu_sum(data), 0.5)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "sums 4096 elements (many blocks)":
-            val data = make_data(4096, 1.0f32)
-            val result = run_reduce_sequential(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 4096.0f32, 2.0f32)).to_equal(true)
+        it "reduce_optimized matches the CPU sum on a ramp of 4096":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential(4096)
+            # 0 + ... + 4095 = 8386560
+            expect(close_enough(run_reduce_optimized(module, data).unwrap(), 8386560.0, 1.0)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "sums non-block-aligned size":
-            val n = 1000
-            val data = make_data(n, 2.0f32)
-            val result = run_reduce_sequential(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 2000.0f32, 1.0f32)).to_equal(true)
+        it "reduce_optimized handles an odd tail smaller than one block":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_data(BLOCK_SIZE * 2 + 37, 2.0)
+            expect(close_enough(run_reduce_optimized(module, data).unwrap(), (BLOCK_SIZE * 2 + 37) as f32 * 2.0, 0.01)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-    describe "optimized (first-add + warp unroll)":
+        it "all three kernels agree with each other":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential(3000)
+            val a = run_reduce_naive(module, data).unwrap()
+            val b = run_reduce_sequential(module, data).unwrap()
+            val c = run_reduce_optimized(module, data).unwrap()
+            expect(close_enough(a, b, 0.5)).to_equal(true)
+            expect(close_enough(b, c, 0.5)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "sums 512 ones (exercises first-add during load)":
-            val data = make_data(512, 1.0f32)
-            val result = run_reduce_optimized(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 512.0f32, 1.0f32)).to_equal(true)
-
-        it "sums 4096 ones":
-            val data = make_data(4096, 1.0f32)
-            val result = run_reduce_optimized(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq(result.unwrap(), 4096.0f32, 2.0f32)).to_equal(true)
-
-        it "sums sequential values correctly":
-            val n = 2048
-            val data = make_sequential(n)
-            val expected = cpu_sum(data)
-            val result = run_reduce_optimized(data)
-            expect(result.is_ok()).to_equal(true)
-            # Allow larger tolerance for large sums (floating point accumulation)
-            expect(approx_eq(result.unwrap(), expected, expected * 0.001f32)).to_equal(true)
-
-    describe "all variants consistency":
-
-        it "all three produce same result for uniform data":
-            val data = make_data(2048, 3.0f32)
-            val r1 = run_reduce_naive(data)
-            val r2 = run_reduce_sequential(data)
-            val r3 = run_reduce_optimized(data)
-            expect(r1.is_ok()).to_equal(true)
-            expect(r2.is_ok()).to_equal(true)
-            expect(r3.is_ok()).to_equal(true)
-            val expected = 2048.0f32 * 3.0f32
-            expect(approx_eq(r1.unwrap(), expected, 2.0f32)).to_equal(true)
-            expect(approx_eq(r2.unwrap(), expected, 2.0f32)).to_equal(true)
-            expect(approx_eq(r3.unwrap(), expected, 2.0f32)).to_equal(true)
-
-        it "all three produce same result for sequential data":
-            val n = 1024
-            val data = make_sequential(n)
-            val expected = cpu_sum(data)
-            val r1 = run_reduce_naive(data)
-            val r2 = run_reduce_sequential(data)
-            val r3 = run_reduce_optimized(data)
-            expect(r1.is_ok()).to_equal(true)
-            expect(r2.is_ok()).to_equal(true)
-            expect(r3.is_ok()).to_equal(true)
-            val tol = expected * 0.001f32
-            expect(approx_eq(r1.unwrap(), expected, tol)).to_equal(true)
-            expect(approx_eq(r2.unwrap(), expected, tol)).to_equal(true)
-            expect(approx_eq(r3.unwrap(), expected, tol)).to_equal(true)
-
-        it "matches CPU reference for large input":
-            val n = 8192
-            val data = make_data(n, 0.5f32)
-            val expected = cpu_sum(data)
-            val r1 = run_reduce_naive(data)
-            val r2 = run_reduce_sequential(data)
-            val r3 = run_reduce_optimized(data)
-            expect(r1.is_ok()).to_equal(true)
-            expect(r2.is_ok()).to_equal(true)
-            expect(r3.is_ok()).to_equal(true)
-            expect(approx_eq(r1.unwrap(), expected, 2.0f32)).to_equal(true)
-            expect(approx_eq(r2.unwrap(), expected, 2.0f32)).to_equal(true)
-            expect(approx_eq(r3.unwrap(), expected, 2.0f32)).to_equal(true)
+        it "empty input reduces to zero without launching":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device reductions", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            var empty: [f32] = []
+            expect(close_enough(run_reduce_naive(module, empty).unwrap(), 0.0, 0.0001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)

@@ -6,13 +6,13 @@ CUDA exercises from [ormastes/cuda_exercise](https://github.com/ormastes/cuda_ex
 
 ```bash
 # Run any example
-bin/simple examples/simple_cuda_example/00.demo/main.spl
+bin/simple run examples/08_gpu/simple_cuda_example/00.demo/main.spl
 
 # Run tests
-bin/simple test examples/simple_cuda_example/test/all_spec.spl
+bin/simple test examples/08_gpu/simple_cuda_example/test/all_spec.spl
 
 # Run a specific exercise
-bin/simple examples/simple_cuda_example/10.cuda_basic/12.First_Kernel/main.spl
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/12.First_Kernel/main.spl
 ```
 
 GPU hardware is **not required** for interpreter mode -- examples that depend on a real device will print a warning and exit gracefully.
@@ -20,7 +20,7 @@ GPU hardware is **not required** for interpreter mode -- examples that depend on
 ## Project Structure
 
 ```
-examples/simple_cuda_example/
+examples/08_gpu/simple_cuda_example/
   lib/                            # Shared helpers
     gpu_test_helpers.spl          # GPU availability checks, alloc/download wrappers
     matrix_helpers.spl            # CPU matrix ops for verification

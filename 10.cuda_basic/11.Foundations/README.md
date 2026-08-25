@@ -3,7 +3,8 @@
 ## Concept
 
 This section provides foundational understanding of GPU architecture.
-There is no code here -- it is purely educational.
+The only code is a device query (`main.spl`): initialise the driver, count
+the devices, print name and compute capability -- the `deviceQuery` sample.
 
 ## GPU vs CPU
 
@@ -52,10 +53,36 @@ Grid
 | `blockIdx.x`                  | `gpu_block_id_x()`              |
 | `blockDim.x`                  | `gpu_block_dim_x()`             |
 | `gridDim.x`                   | `gpu_grid_dim_x()`              |
-| `__shared__ float s[N]`       | `@gpu_shared val s = gpu_shared_array[f32](N)` |
-| `__syncthreads()`             | `gpu_barrier()`                 |
-| `atomicAdd(&x, v)`            | `gpu_atomic_add(x, v)`          |
+| `__shared__ float s[N]`       | `val s = gpu_shared_array_f32(N)` (+ `gpu_shared_load_f32` / `gpu_shared_store_f32`) |
+| `__syncthreads()`             | `gpu_barrier()` / `gpu_syncthreads()` |
+| `atomicAdd(&x[i], v)`         | `gpu_atomic_add_i32(x, i, v)`    |
 | `kernel<<<grid, block>>>()`   | `kernel<<<grid: (gx,gy,gz), block: (bx,by,bz)>>>()` |
+
+## Run
+```bash
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/11.Foundations/main.spl
+bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/11.Foundations/spec.spl
+```
+
+`std.cuda` exposes the driver API as plain status words and `i64` handles:
+`cuda_init()` first (like `cuInit`), then `cuda_device_count()`,
+`cuda_device_get(i)`, `cuda_device_name(handle)` and
+`cuda_device_compute_capability(handle)` (packed as `major * 10 + minor`).
+
+## Try it (verified doctest)
+The grid/block arithmetic every later module uses, with no device needed:
+
+```sdoctest
+>>> val n = 1000
+>>> val block = 256
+>>> val grid = (n + block - 1) / block
+>>> print "{grid} blocks x {block} threads = {grid * block} slots for {n} elements"
+4 blocks x 256 threads = 1024 slots for 1000 elements
+>>> val packed = 86
+>>> print "sm_{packed / 10}{packed % 10}"
+sm_86
+>>> if grid != 4 or grid * block < n: panic("grid does not cover the input")
+```
 
 ## Key Principles
 

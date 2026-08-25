@@ -9,20 +9,20 @@ CUDA's `cudaMalloc`, `cudaMemcpy`, `cudaFree`, and `cudaMemset`.
 
 | Simple | CUDA | Description |
 |--------|------|-------------|
-| `gpu_alloc<T>(n)` | `cudaMalloc` | Allocate n elements of type T on device |
-| `gpu_upload(buf, data)` | `cudaMemcpy(H2D)` | Copy host data to device buffer |
-| `gpu_download<T>(buf, n)` | `cudaMemcpy(D2H)` | Copy device data to host |
-| `gpu_free(buf)` | `cudaFree` | Free device buffer |
-| `gpu_memset(buf, val, n)` | `cudaMemset` | Set device memory to a byte value |
-| `gpu_copy(dst, src, n)` | `cudaMemcpy(D2D)` | Device-to-device copy |
+| `gpu_alloc(bytes)` | `cudaMalloc` | Allocate `bytes` on the device -> `GpuPtr` |
+| `gpu_upload_f32(ptr, data)` | `cudaMemcpy(H2D)` | Copy a host `[f32]` to the device |
+| `gpu_download_f32(ptr, n)` | `cudaMemcpy(D2H)` | Copy `n` f32 back to a host `[f32]` |
+| `gpu_free(ptr)` | `cudaFree` | Free device buffer (null pointer is a no-op) |
+| `gpu_memset(ptr, byte, bytes)` | `cudaMemset` | Set device memory to a byte value |
+| `gpu_copy_f32(dst, src, n)` | `cudaMemcpy(D2D)` | Device-to-device copy of `n` f32 |
 
 ### Memory Lifecycle
 
 ```
-1. Allocate:  val buf = gpu_alloc<f32>(1024)?
-2. Upload:    gpu_upload(buf, host_data)?
-3. Compute:   kernel<<<grid, block>>>(buf, ...)
-4. Download:  val result = gpu_download<f32>(buf, 1024)?
+1. Allocate:  val buf = gpu_alloc(1024 * 4)?
+2. Upload:    gpu_upload_f32(buf, host_data)?
+3. Compute:   kernel<<<grid: (4, 1, 1), block: (256, 1, 1)>>>(buf, ...)
+4. Download:  val result = gpu_download_f32(buf, 1024)?
 5. Free:      gpu_free(buf)?
 ```
 
@@ -31,23 +31,22 @@ CUDA's `cudaMalloc`, `cudaMemcpy`, `cudaFree`, and `cudaMemset`.
 All memory operations return `Result<T, GpuError>`. Use `?` for propagation:
 
 ```simple
-fn process() -> Result<List<f32>, GpuError>:
-    val buf = gpu_alloc<f32>(1024)?    # Propagates allocation failure
-    gpu_upload(buf, data)?              # Propagates transfer failure
-    val result = gpu_download<f32>(buf, 1024)?
+fn process() -> Result<[f32], GpuError>:
+    val buf = gpu_alloc(1024 * 4)?      # Propagates allocation failure
+    gpu_upload_f32(buf, data)?          # Propagates transfer failure
+    val result = gpu_download_f32(buf, 1024)?
     gpu_free(buf)?
     Ok(result)
 ```
 
 ### Key Differences from CUDA C
 
-1. **Typed buffers:** `GpuBuffer<f32>` carries its element type, preventing
-   accidental size mismatches.
+1. **Untyped handles, typed transfers:** a `GpuPtr` is bytes (`device_ptr`,
+   `size`, `is_valid`); `gpu_upload_f32` / `gpu_download_f32` carry the type.
 2. **No raw pointers:** Cannot accidentally dereference device memory on host.
 3. **Result-based errors:** No unchecked error codes; the compiler enforces
    handling via `Result<T, GpuError>`.
-4. **Size tracking:** `GpuBuffer` knows its allocated size, enabling bounds
-   checking in debug mode.
+4. **Size tracking:** `GpuPtr.size` records the allocation size in bytes.
 
 ## Files
 
@@ -61,3 +60,23 @@ fn process() -> Result<List<f32>, GpuError>:
 - Use `gpu_memset` for initialization
 - Handle errors with `Result` and `?`
 - Understand the host/device memory separation
+
+## Run
+```bash
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/19.Memory_API/main.spl
+bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/19.Memory_API/spec.spl
+```
+
+## Try it (verified doctest)
+Sizes are bytes, and the handle type is inspectable without a device:
+
+```sdoctest
+>>> use std.gpu.*
+>>> val n = 1024
+>>> print "{n} f32 = {n * 4} bytes"
+1024 f32 = 4096 bytes
+>>> val p = GpuPtr.null()
+>>> print "null: valid={p.is_valid} size={p.size} free_ok={gpu_free(p).is_ok()}"
+null: valid=false size=0 free_ok=true
+>>> if n * 4 != 4096 or p.is_valid or not gpu_free(p).is_ok(): panic("GpuPtr semantics drifted")
+```

@@ -15,7 +15,6 @@
 #   }
 
 use std.gpu.*
-use std.gpu_runtime.*
 
 # ============================================================================
 # Device helper: compute flat 1D index from 2D grid/block layout
@@ -67,9 +66,19 @@ fn verify_results(host_a: [f32], host_b: [f32], host_c: [f32], n: i64) -> bool:
 
 # ============================================================================
 # Main
+#
+# `main` itself returns nothing: the whole pipeline lives in `run()` so every
+# GPU call can use `?`, and `main` matches the final Result and prints it.
 # ============================================================================
 
-fn main() -> Result<(), GpuError>:
+fn main():
+    match run():
+        case Ok(_):
+            print "=== Done ==="
+        case Err(e):
+            print "GPU error: {e.to_text()}"
+
+fn run() -> Result<(), GpuError>:
     print "=== Vector Add 2D (Simple) ==="
     print ""
 
@@ -135,7 +144,5 @@ fn main() -> Result<(), GpuError>:
     gpu_free(d_b)?
     gpu_free(d_c)?
     print "Device memory freed."
-
     print ""
-    print "=== Done ==="
     Ok(())

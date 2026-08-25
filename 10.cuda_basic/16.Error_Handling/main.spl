@@ -12,7 +12,6 @@
 #   val d_a = gpu_alloc(size)?   // ? propagates on Err
 
 use std.gpu.*
-use std.gpu_runtime.*
 
 # ============================================================================
 # Pattern 1: Basic error propagation with ?
@@ -126,8 +125,24 @@ fn full_pipeline(data: [f32]) -> Result<f32, GpuError>:
 # Main
 # ============================================================================
 
+fn bring_up_device() -> Result<(), GpuError>:
+    # cuInit + cuCtxCreate. Everything below needs a live context, and every
+    # step of that bring-up is itself fallible.
+    gpu_init()?
+    gpu_set_device(0)?
+    Ok(())
+
 fn main():
     print "=== Error Handling Patterns (Simple GPU) ==="
+    print ""
+
+    # --- Pattern 0: bring the device up, report (not crash) if it is absent ---
+    print "Pattern 0: driver bring-up"
+    match bring_up_device():
+        case Ok(_):
+            print "  Device 0 ready ({gpu_device_count()} device(s) visible)"
+        case Err(e):
+            print "  No usable device: {e.message} - later patterns will report errors"
     print ""
 
     # --- Pattern 1: basic ? propagation ---

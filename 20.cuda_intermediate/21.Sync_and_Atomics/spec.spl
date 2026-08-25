@@ -1,177 +1,93 @@
 # Exercise 21: Synchronization and Atomics - Tests
-
-use std.gpu.{GpuError}
+#
+# Runs the PTX kernels from main.spl on the real CUDA device and checks the
+# downloaded values against CPU references. When no device is present every
+# GPU example is reported as a skip (not a silent pass).
 
 use self.main.{
-    run_atomic_count, run_atomic_minmax,
-    run_histogram, run_cas_max, run_block_reduce_sum
+    PTX, run_atomic_count, run_atomic_minmax, run_histogram,
+    run_cas_max, run_block_reduce_sum, make_ramp, cpu_histogram
 }
-
-fn approx_eq_f32(a: f32, b: f32, tol: f32) -> bool:
-    val diff = a - b
-    diff < tol and diff > (0.0f32 - tol)
+use gpu_test_helpers.{gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload, close_enough}
 
 describe "Sync and Atomics":
 
-    describe "atomic counter":
+    describe "CPU references":
 
-        it "counts all threads":
-            val result = run_atomic_count(1000)
-            expect(result.is_ok()).to_equal(true)
-            expect(result.unwrap()).to_equal(1000)
+        it "make_ramp spans -500 .. 6493 for n = 1000":
+            val data = make_ramp(1000)
+            expect(data.len()).to_equal(1000)
+            expect(data[0]).to_equal(-500)
+            expect(data[999]).to_equal(6493)
 
-        it "counts across multiple blocks":
-            # 10000 threads = ~40 blocks of 256
-            val result = run_atomic_count(10000)
-            expect(result.is_ok()).to_equal(true)
-            expect(result.unwrap()).to_equal(10000)
+        it "cpu_histogram bins negative values into non-negative bins":
+            val hist = cpu_histogram([-1, 9, 19, 0], 10)
+            expect(hist[9]).to_equal(3)
+            expect(hist[0]).to_equal(1)
 
-        it "handles single thread":
-            val result = run_atomic_count(1)
-            expect(result.is_ok()).to_equal(true)
-            expect(result.unwrap()).to_equal(1)
+    describe "device kernels":
 
-    describe "atomic min/max":
+        it "atomic counter counts every thread across 40 blocks":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(module > 0).to_equal(true)
+            expect(run_atomic_count(module, 10000).unwrap()).to_equal(10000)
+            expect(run_atomic_count(module, 1).unwrap()).to_equal(1)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "finds min and max of sequential data":
-            var data = List<i32>()
-            var i = 0
-            while i < 256:
-                data.push(i)
-                i = i + 1
-            val result = run_atomic_minmax(data)
-            expect(result.is_ok()).to_equal(true)
-            val mm = result.unwrap()
-            expect(mm[0]).to_equal(0)
-            expect(mm[1]).to_equal(255)
+        it "atomic min/max find the extremes of the ramp":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val mm = run_atomic_minmax(module, make_ramp(1000)).unwrap()
+            expect(mm[0]).to_equal(-500)
+            expect(mm[1]).to_equal(6493)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "finds min and max with negative values":
-            var data = List<i32>()
-            var i = 0
-            while i < 500:
-                data.push(i - 250)
-                i = i + 1
-            val result = run_atomic_minmax(data)
-            expect(result.is_ok()).to_equal(true)
-            val mm = result.unwrap()
-            expect(mm[0]).to_equal(-250)
-            expect(mm[1]).to_equal(249)
-
-        it "handles all-same values":
-            var data = List<i32>()
-            var i = 0
-            while i < 100:
-                data.push(42)
-                i = i + 1
-            val result = run_atomic_minmax(data)
-            expect(result.is_ok()).to_equal(true)
-            val mm = result.unwrap()
-            expect(mm[0]).to_equal(42)
-            expect(mm[1]).to_equal(42)
-
-    describe "histogram":
-
-        it "builds uniform histogram":
-            # Data: 0,1,2,...,9,0,1,2,...,9,...  (100 of each)
-            var data = List<i32>()
-            var i = 0
-            while i < 1000:
-                data.push(i % 10)
-                i = i + 1
-            val result = run_histogram(data, 10)
-            expect(result.is_ok()).to_equal(true)
-            val hist = result.unwrap()
+        it "histogram matches the CPU reference bin for bin":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            var data: [i64] = []
+            for i in 0..1000:
+                data.push(i * 3 - 700)
+            val hist = run_histogram(module, data, 10).unwrap()
+            val ref = cpu_histogram(data, 10)
             expect(hist.len()).to_equal(10)
-            var bin = 0
-            while bin < 10:
-                expect(hist[bin]).to_equal(100)
-                bin = bin + 1
+            for b in 0..10:
+                expect(hist[b]).to_equal(ref[b])
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "builds skewed histogram":
-            # All values are 0 -> bin 0 gets everything
-            var data = List<i32>()
-            var i = 0
-            while i < 512:
-                data.push(0)
-                i = i + 1
-            val result = run_histogram(data, 4)
-            expect(result.is_ok()).to_equal(true)
-            val hist = result.unwrap()
-            expect(hist[0]).to_equal(512)
-            expect(hist[1]).to_equal(0)
-            expect(hist[2]).to_equal(0)
-            expect(hist[3]).to_equal(0)
+        it "CAS set-if-greater converges to the maximum":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(run_cas_max(module, make_ramp(1000)).unwrap()).to_equal(6493)
+            expect(run_cas_max(module, [-5, -3, -9]).unwrap()).to_equal(-3)
+            gpu_unload(module)
+            gpu_teardown(ctx)
 
-        it "total of all bins equals input size":
-            var data = List<i32>()
-            var i = 0
-            while i < 777:
-                data.push(i * 13)
-                i = i + 1
-            val result = run_histogram(data, 8)
-            expect(result.is_ok()).to_equal(true)
-            val hist = result.unwrap()
-            var total = 0
-            var bin = 0
-            while bin < 8:
-                total = total + hist[bin]
-                bin = bin + 1
-            expect(total).to_equal(777)
-
-    describe "compare-and-swap max":
-
-        it "finds maximum via CAS":
-            var data = List<i32>()
-            var i = 0
-            while i < 1000:
-                data.push(i)
-                i = i + 1
-            val result = run_cas_max(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(result.unwrap()).to_equal(999)
-
-        it "finds maximum with scattered values":
-            var data = List<i32>()
-            data.push(10)
-            data.push(500)
-            data.push(3)
-            data.push(999)
-            data.push(42)
-            data.push(1)
-            val result = run_cas_max(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(result.unwrap()).to_equal(999)
-
-    describe "block reduce sum":
-
-        it "sums 1024 ones":
-            var data = List<f32>()
-            var i = 0
-            while i < 1024:
-                data.push(1.0f32)
-                i = i + 1
-            val result = run_block_reduce_sum(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq_f32(result.unwrap(), 1024.0f32, 1.0f32)).to_equal(true)
-
-        it "sums sequential values":
-            # Sum of 0..255 = 255*256/2 = 32640
-            var data = List<f32>()
-            var i = 0
-            while i < 256:
-                data.push(i * 1.0f32)
-                i = i + 1
-            val result = run_block_reduce_sum(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq_f32(result.unwrap(), 32640.0f32, 1.0f32)).to_equal(true)
-
-        it "sums across multiple blocks":
-            # 2048 elements = 8 blocks of 256
-            var data = List<f32>()
-            var i = 0
-            while i < 2048:
-                data.push(0.5f32)
-                i = i + 1
-            val result = run_block_reduce_sum(data)
-            expect(result.is_ok()).to_equal(true)
-            expect(approx_eq_f32(result.unwrap(), 1024.0f32, 1.0f32)).to_equal(true)
+        it "block reduce sums 1024 ones and a non-multiple of the block size":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            var ones: [f32] = []
+            for i in 0..1024:
+                ones.push(1.0)
+            expect(close_enough(run_block_reduce_sum(module, ones).unwrap(), 1024.0, 0.01)).to_equal(true)
+            var ramp: [f32] = []
+            for i in 0..300:
+                ramp.push(i as f32)
+            # 0 + 1 + ... + 299 = 44850
+            expect(close_enough(run_block_reduce_sum(module, ramp).unwrap(), 44850.0, 0.5)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)

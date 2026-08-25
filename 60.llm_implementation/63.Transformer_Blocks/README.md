@@ -1,29 +1,58 @@
 # Transformer Blocks
 
 **Tier:** 2 (Concept Adaptation)
-**Original CUDA Concept:** Full transformer block: attention + FFN + layer norm + residual connections
+**Original CUDA Concept:** Pre-norm decoder block: LayerNorm, GELU, residual, FFN (`63.Transformer_Blocks`)
 
-## Simple Approach
+## What this module does
 
-Simple uses the `~>` pipeline operator to compose transformer blocks from individual
-layers. Each sub-layer (attention, FFN, layer norm) is a composable unit that can be
-connected into a pipeline with automatic dimension propagation.
+```
+h = x + Attention(LayerNorm(x))
+y = h + FFN(LayerNorm(h))          FFN(z) = GELU(z W1 + b1) W2 + b2
+```
 
-Key features:
-- **Pipeline composition:** `attention ~> LayerNorm ~> FFN ~> LayerNorm`
-- **Residual connections:** Built-in `Residual(sublayer)` wrapper
-- **Layer norm kernel:** GPU-accelerated normalization
-- **GELU activation:** GPU kernel for the feed-forward network
+`main.spl` runs the block as a CPU reference model (the checked result): a
+per-row LayerNorm, the tanh-approximation GELU, residual adds, two linear
+layers and a compact causal self-attention. The GELU kernel is then run as a
+`@gpu_kernel` through `std.gpu` (module 12 pattern) and compared against the
+CPU model, reported honestly: a `<<<>>>` launch is a no-op on the Rust seed, so
+the demo prints MISMATCH instead of a fake pass.
 
-## Concepts Covered
+## Honest status
 
-- Layer normalization on GPU
-- Feed-forward network (two linear layers + GELU)
-- Residual (skip) connections
-- Full transformer block assembly
-- Pipeline composition with `~>`
+- Works: CPU LayerNorm / GELU / residual / linear / block composition;
+  `std.gpu` buffers and a 1D element-wise launch.
+- Not in the current API: `std.ml` layer types (`Linear`, `LayerNorm`, `GELU`,
+  `Residual`, `MultiHeadAttention`) and `~>` layer composition; block-wide
+  LayerNorm reductions need `@shared` arrays, which `@gpu_kernel` lacks.
+
+## CPU model (doctest)
+
+```sdoctest
+>>> fn layer_norm_row(xs: [f64]) -> [f64]:
+...     var mean = 0.0
+...     for x in xs:
+...         mean = mean + x
+...     mean = mean / (xs.len() as f64)
+...     var variance = 0.0
+...     for x in xs:
+...         variance = variance + (x - mean) * (x - mean)
+...     variance = variance / (xs.len() as f64)
+...     val inv = 1.0 / (variance + 0.00001).sqrt()
+...     var out: [f64] = []
+...     for x in xs:
+...         out.push((x - mean) * inv)
+...     out
+>>> fn gelu(x: f64) -> f64:
+...     0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh())
+>>> val n = layer_norm_row([1.0, 3.0])
+>>> print "normalised [1, 3] -> [{(n[0] - 0.5) as i64}, {(n[1] + 0.5) as i64}]"
+normalised [1, 3] -> [-1, 1]
+>>> print "gelu(0) = {gelu(0.0) as i64}, gelu(5) rounded = {(gelu(5.0) + 0.5) as i64}"
+gelu(0) = 0, gelu(5) rounded = 5
+>>> assert (n[0] - 0.5) as i64 == -1 and (gelu(5.0) + 0.5) as i64 == 5
+```
 
 ## Files
 
-- `main.spl` - Transformer block with attention, FFN, layer norm
-- `spec.spl` - Tests for transformer block components
+- `main.spl` - CPU pre-norm block + `@gpu_kernel` GELU demo
+- `spec.spl` - CPU-reference tests (LayerNorm, GELU, residual, linear, widths)

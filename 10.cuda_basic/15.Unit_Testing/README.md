@@ -43,5 +43,20 @@ it "kernel produces correct results":
 
 ## Run
 ```bash
-bin/simple test examples/simple_cuda_example/10.cuda_basic/15.Unit_Testing/spec.spl
+bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/15.Unit_Testing/spec.spl
+```
+
+## Try it (verified doctest)
+The CPU reference used by the spec, plus the tolerance helper, run without a
+device (sum of 1..8 is 36; a block of 256 reduces 1000 elements in 4 blocks):
+
+```sdoctest
+>>> val data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+>>> var total = 0.0
+>>> for x in data: total = total + x
+>>> print "sum = {total}"
+sum = 36.0
+>>> val blocks = (1000 + 255) / 256
+>>> print "{blocks} partial sums"
+4 partial sums
 ```

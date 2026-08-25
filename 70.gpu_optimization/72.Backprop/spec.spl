@@ -1,76 +1,94 @@
-use std.gpu.{GpuDevice}
-use std.math.{abs}
+# 72. Backprop - Tests
+#
+# Hardware-independent: every kernel's host formulation is checked on tiny,
+# exactly-representable inputs, and a full training step must lower the loss.
+
+use std.gpu.*
+use self.main.{
+    linear_forward, relu_forward, relu_backward, softmax_row, softmax_xent_backward,
+    linear_backward_input, linear_backward_weights, linear_backward_bias, sgd_update,
+    make_layer, cross_entropy_loss, train_step, transpose
+}
 
 describe "Backpropagation kernels":
-    it "should compute ReLU backward correctly":
-        val dev = GpuDevice.get(0)?
-        val d_output = dev.alloc_copy([1.0, -2.0, 3.0, -4.0])?
-        val input = dev.alloc_copy([0.5, -0.5, 1.0, -1.0])?
-        var d_input = dev.alloc_f32(4)?
-        dev.launch(relu_backward_kernel, grid: 1, block: 4,
-            args: (d_output, input, d_input, 4))
-        dev.sync()?
-        val result = d_input.to_host()?
-        # ReLU grad: pass through where input > 0, zero where input <= 0
-        expect(result[0]).to_equal(1.0)   # input>0, pass d_output
-        expect(result[1]).to_equal(0.0)   # input<0, zero
-        expect(result[2]).to_equal(3.0)   # input>0, pass d_output
-        expect(result[3]).to_equal(0.0)   # input<0, zero
+    it "should compute ReLU forward and backward correctly":
+        val input = [-1.0, 0.0, 2.0, -3.0, 4.0]
+        val out = relu_forward(input)
+        expect(out[0]).to_equal(0.0)
+        expect(out[2]).to_equal(2.0)
+        expect(out[4]).to_equal(4.0)
+        val d_in = relu_backward([1.0, 1.0, 1.0, 1.0, 1.0], input)
+        expect(d_in[0]).to_equal(0.0)
+        expect(d_in[1]).to_equal(0.0)
+        expect(d_in[2]).to_equal(1.0)
+        expect(d_in[4]).to_equal(1.0)
+
+    it "should compute a linear forward pass with bias":
+        # x = [1 2], W = [[1 0],[0 1]], b = [10 20] -> [11 22]
+        val y = linear_forward([1.0, 2.0], [1.0, 0.0, 0.0, 1.0], [10.0, 20.0], 1, 2, 2)?
+        expect(y[0]).to_equal(11.0)
+        expect(y[1]).to_equal(22.0)
+
+    it "should compute softmax of equal logits as uniform":
+        val p = softmax_row([0.0, 0.0, 0.0, 0.0], 0, 4)
+        expect(p[0]).to_equal(0.25)
+        expect(p[3]).to_equal(0.25)
 
     it "should compute softmax cross-entropy gradient":
-        val dev = GpuDevice.get(0)?
-        # 1 sample, 3 classes, logits = [2.0, 1.0, 0.1], label = 0
-        val logits = dev.alloc_copy([2.0, 1.0, 0.1])?
-        val labels = dev.alloc_copy([0])?
-        var d_logits = dev.alloc_f32(3)?
-        dev.launch(softmax_cross_entropy_backward_kernel,
-            grid: 1, block: 3,
-            args: (logits, labels, d_logits, 1, 3))
-        dev.sync()?
-        val grad = d_logits.to_host()?
-        # softmax([2,1,0.1]) ~ [0.659, 0.242, 0.099]
-        # grad for label=0: [0.659-1, 0.242, 0.099] = [-0.341, 0.242, 0.099]
-        expect(grad[0]).to_be_less_than(0.0)  # negative for correct class
-        expect(grad[1]).to_be_greater_than(0.0)
-        expect(grad[2]).to_be_greater_than(0.0)
-        # Sum should be approximately 0
-        val total = grad[0] + grad[1] + grad[2]
-        expect(abs(total)).to_be_less_than(0.01)
+        # uniform probs 0.5/0.5, label 0 -> d = [0.5-1, 0.5] / batch(1)
+        val d = softmax_xent_backward([0.0, 0.0], [0], 1, 2)
+        expect(d[0]).to_equal(-0.5)
+        expect(d[1]).to_equal(0.5)
+
+    it "should scale the gradient by the batch size":
+        val d = softmax_xent_backward([0.0, 0.0, 0.0, 0.0], [0, 1], 2, 2)
+        expect(d[0]).to_equal(-0.25)
+        expect(d[3]).to_equal(-0.25)
+
+    it "should compute input gradient dx = dy W^T":
+        # W = [[1 2],[3 4]] (2 in x 2 out), dy = [1 1] -> dx = [1+2, 3+4]
+        val dx = linear_backward_input([1.0, 1.0], [1.0, 2.0, 3.0, 4.0], 1, 2, 2)?
+        expect(dx[0]).to_equal(3.0)
+        expect(dx[1]).to_equal(7.0)
+
+    it "should accumulate weight and bias gradients over the batch":
+        # x rows [1 2], [3 4]; dy rows [1 0], [0 1] -> dW = x^T dy = [[1 3],[2 4]]
+        val dw = linear_backward_weights([1.0, 0.0, 0.0, 1.0], [1.0, 2.0, 3.0, 4.0], 2, 2, 2)
+        expect(dw[0]).to_equal(1.0)
+        expect(dw[1]).to_equal(3.0)
+        expect(dw[2]).to_equal(2.0)
+        expect(dw[3]).to_equal(4.0)
+        val db = linear_backward_bias([1.0, 0.0, 0.0, 1.0], 2, 2)
+        expect(db[0]).to_equal(1.0)
+        expect(db[1]).to_equal(1.0)
 
     it "should update weights with SGD":
-        val dev = GpuDevice.get(0)?
-        var weights = dev.alloc_copy([1.0, 2.0, 3.0])?
-        val gradients = dev.alloc_copy([0.1, 0.2, 0.3])?
-        val lr = 0.5f32
-        dev.launch(sgd_update_kernel, grid: 1, block: 3,
-            args: (weights, gradients, lr, 3))
-        dev.sync()?
-        val result = weights.to_host()?
-        # w = w - lr * grad
-        expect(result[0]).to_equal(0.95)   # 1.0 - 0.5*0.1
-        expect(result[1]).to_equal(1.9)    # 2.0 - 0.5*0.2
-        expect(result[2]).to_equal(2.85)   # 3.0 - 0.5*0.3
+        val w = sgd_update([1.0, 2.0, 3.0], [0.5, 1.0, -1.0], 0.1)
+        expect(w[0]).to_equal(0.95)
+        expect(w[1]).to_equal(1.9)
+        expect(w[2]).to_equal(3.1)
 
-    it "should create linear layer":
-        val dev = GpuDevice.get(0)?
-        val layer = LinearLayer.create(dev, 4, 3)?
-        expect(layer.in_dim).to_equal(4)
-        expect(layer.out_dim).to_equal(3)
+    it "should create a layer with zeroed gradients":
+        val layer = make_layer(3, 2, 0.1)
+        expect(layer.weights.len()).to_equal(6)
+        expect(layer.d_weights.len()).to_equal(6)
+        expect(layer.d_bias[1]).to_equal(0.0)
+        expect(layer.weights[5]).to_equal(0.1)
 
-    it "should zero gradients":
-        val dev = GpuDevice.get(0)?
-        val layer = LinearLayer.create(dev, 4, 3)?
-        layer.zero_grad(dev)?
-        val dw = layer.d_weights.to_host()?
+    it "should lower the loss over training steps":
+        val layer = make_layer(3, 2, 0.1)
+        val input = [1.0, 0.0, 0.0,  0.0, 1.0, 1.0,  1.0, 0.1, 0.0,  0.0, 0.5, 1.0]
+        val labels = [0, 1, 0, 1]
+        val first = train_step(layer, input, labels, 4, 0.5)?
+        var last = first
         var i = 0
-        while i < dw.len():
-            expect(dw[i]).to_equal(0.0)
+        while i < 9:
+            last = train_step(layer, input, labels, 4, 0.5)?
             i = i + 1
+        expect(last < first).to_equal(true)
+        expect(cross_entropy_loss([0.0, 0.0], [0], 1, 2) > 0.69).to_equal(true)
 
-    it "should complete full training step without error":
-        val dev = GpuDevice.get(0)?
-        val layer = LinearLayer.create(dev, 8, 4)?
-        val input = dev.alloc_copy([f32].fill(2 * 8, 0.5))?
-        val labels = dev.alloc_copy([1, 2])?
-        val result = train_step(dev, layer, input, labels, 2, 8, 4, 0.01)
-        expect(result.?).to_equal(true)
+    it "should transpose a 2x3 matrix":
+        val t = transpose([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3)
+        expect(t[1]).to_equal(4.0)
+        expect(t[2]).to_equal(2.0)

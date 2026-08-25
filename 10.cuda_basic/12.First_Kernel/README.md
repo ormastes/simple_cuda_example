@@ -61,5 +61,26 @@ gpu_download(d_c, host_c_ptr, n * 4)?
 
 ## Run
 ```bash
-bin/simple examples/simple_cuda_example/10.cuda_basic/12.First_Kernel/main.spl
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/12.First_Kernel/main.spl
+bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/12.First_Kernel/spec.spl
+```
+
+The pipeline lives in `run() -> Result<(), GpuError>` so every call can use
+`?`; `main` matches the Result and prints `GpuError.to_text()` on failure.
+
+## Try it (verified doctest)
+The launch geometry and the `flat_index` arithmetic, evaluated on the CPU:
+
+```sdoctest
+>>> val width = 64
+>>> val height = 32
+>>> val gx = (width + 15) / 16
+>>> val gy = (height + 15) / 16
+>>> print "grid ({gx}, {gy}) x block (16, 16) = {gx * gy * 256} threads for {width * height} elements"
+grid (4, 2) x block (16, 16) = 2048 threads for 2048 elements
+>>> val row = 1
+>>> val col = 3
+>>> print "flat index of (row {row}, col {col}) = {row * gx * 16 + col}"
+flat index of (row 1, col 3) = 67
+>>> if gx != 4 or gy != 2 or row * gx * 16 + col != 67: panic("index math drifted")
 ```

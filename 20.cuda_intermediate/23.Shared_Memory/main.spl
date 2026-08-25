@@ -1,285 +1,317 @@
-# Exercise 23: Shared Memory Reduction Patterns
+# Exercise 23: Shared Memory - Parallel Reduction
 #
-# Three variants of parallel sum reduction:
-# 1. Naive interleaved addressing
-# 2. Sequential addressing (no bank conflicts)
-# 3. First-add during load + unroll last warp
+# Three reduction kernels of increasing quality, each writing one partial sum
+# per block into `output[blockIdx.x]`; the host adds the partials:
+#
+#   reduce_naive       interleaved addressing with `tid % (2*s) == 0`
+#                      (divergent warps, bank conflicts)
+#   reduce_sequential  sequential addressing `if tid < s: sh[tid] += sh[tid+s]`
+#                      (no divergence within a warp until s < 32)
+#   reduce_optimized   first add during the global load (each thread reads two
+#                      elements, half as many blocks) + sequential addressing
+#
+# Kernels are hand-written PTX launched through `std.cuda` (see
+# lib/gpu_test_helpers.spl for why). They mirror reduction.cu in
+# cuda_exercise/20.cuda_intermediate/23.Shared_Memory.
 
-use std.gpu.{
-    gpu_alloc, gpu_upload, gpu_download, gpu_free, gpu_memset,
-    gpu_shared_mem, gpu_syncthreads,
-    gpu_atomic_add,
-    gpu_block_id_x, gpu_block_dim_x, gpu_local_id_x,
-    gpu_grid_dim_x,
-    gpu_launch, GpuBuffer, GpuError
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_zeroed_words, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_run_1d, grid_for
 }
 
 val BLOCK_SIZE = 256
 
-# --------------------------------------------------------------------------
-# Variant 1: Naive interleaved reduction
-#
-# At each step, thread i adds element at position (i + stride) where
-# stride starts at 1 and doubles each step.
-#
-# Problem: threads 0, 2, 4, ... then 0, 4, 8, ... are active,
-# causing divergent warps. Also, interleaved access patterns cause
-# shared memory bank conflicts.
-# --------------------------------------------------------------------------
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
 
-@gpu_kernel
-fn reduce_naive(input: GpuBuffer<f32>, output: GpuBuffer<f32>, n: i32):
-    val shared = gpu_shared_mem<f32>(BLOCK_SIZE)
+// Interleaved addressing:  for (s = 1; s < blockDim; s *= 2) if (tid % (2s) == 0) sh[tid] += sh[tid + s]
+.visible .entry reduce_naive(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<20>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    mov.u32 %r5, 1;
+LOOP:
+    setp.ge.u32 %p2, %r5, %r2;
+    @%p2 bra AFTER;
+    shl.b32 %r6, %r5, 1;
+    rem.u32 %r7, %r3, %r6;
+    setp.ne.u32 %p3, %r7, 0;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    mov.u32 %r5, %r6;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
 
-    val tid = gpu_local_id_x()
-    val global_idx = gpu_block_id_x() * gpu_block_dim_x() + tid
+// Sequential addressing:  for (s = blockDim/2; s > 0; s >>= 1) if (tid < s) sh[tid] += sh[tid + s]
+.visible .entry reduce_sequential(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<20>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
 
-    # Load from global to shared
-    if global_idx < n:
-        shared[tid] = input[global_idx]
-    else:
-        shared[tid] = 0.0f32
-    gpu_syncthreads()
+// First add during load: i = blockIdx*(2*blockDim) + tid; sh[tid] = in[i] + in[i + blockDim]
+// then sequential addressing. Launch with half as many blocks.
+.visible .entry reduce_optimized(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<24>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    shl.b32 %r8, %r2, 1;
+    mad.lo.u32 %r4, %r1, %r8, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    cvt.u64.u32 %rd17, %r2;
+    add.u64 %rd18, %rd4, %rd17;
+    setp.ge.u64 %p5, %rd18, %rd3;
+    @%p5 bra STORE;
+    shl.b64 %rd19, %rd18, 2;
+    add.u64 %rd20, %rd1, %rd19;
+    ld.global.f32 %f6, [%rd20];
+    add.f32 %f1, %f1, %f6;
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
+"""
 
-    # Naive interleaved reduction
-    # stride: 1, 2, 4, 8, ...
-    var stride = 1
-    while stride < gpu_block_dim_x():
-        # Only threads where (tid % (2*stride)) == 0 are active
-        if tid % (2 * stride) == 0:
-            shared[tid] = shared[tid] + shared[tid + stride]
-        gpu_syncthreads()
-        stride = stride * 2
+# ----------------------------------------------------------------------------
+# Host helpers
+# ----------------------------------------------------------------------------
 
-    # Thread 0 writes block result
-    if tid == 0:
-        gpu_atomic_add(output, 0, shared[0])
+fn make_data(n: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(fill)
+    out
 
-# --------------------------------------------------------------------------
-# Variant 2: Sequential addressing
-#
-# Instead of interleaved access, we use sequential addressing:
-# stride starts at blockDim/2 and halves each step. Thread i adds
-# element at (i + stride). This avoids bank conflicts because
-# consecutive threads access consecutive memory locations.
-# --------------------------------------------------------------------------
+fn make_sequential(n: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(i as f32)
+    out
 
-@gpu_kernel
-fn reduce_sequential(input: GpuBuffer<f32>, output: GpuBuffer<f32>, n: i32):
-    val shared = gpu_shared_mem<f32>(BLOCK_SIZE)
-
-    val tid = gpu_local_id_x()
-    val global_idx = gpu_block_id_x() * gpu_block_dim_x() + tid
-
-    # Load from global to shared
-    if global_idx < n:
-        shared[tid] = input[global_idx]
-    else:
-        shared[tid] = 0.0f32
-    gpu_syncthreads()
-
-    # Sequential addressing reduction
-    # stride: blockDim/2, blockDim/4, ..., 2, 1
-    var stride = gpu_block_dim_x() / 2
-    while stride > 0:
-        if tid < stride:
-            shared[tid] = shared[tid] + shared[tid + stride]
-        gpu_syncthreads()
-        stride = stride / 2
-
-    # Thread 0 writes block result
-    if tid == 0:
-        gpu_atomic_add(output, 0, shared[0])
-
-# --------------------------------------------------------------------------
-# Variant 3: First-add during load + unroll last warp
-#
-# Optimization 1: Each thread loads TWO elements and adds them during
-# the initial load. This halves the number of reduction steps needed.
-# We launch half as many threads as data elements.
-#
-# Optimization 2: When stride <= 32 (warp size), all active threads
-# are in the same warp and execute in lockstep. We can skip
-# gpu_syncthreads() for the final iterations. This is called
-# "warp-synchronous" reduction.
-# --------------------------------------------------------------------------
-
-@gpu_kernel
-fn reduce_optimized(input: GpuBuffer<f32>, output: GpuBuffer<f32>, n: i32):
-    val shared = gpu_shared_mem<f32>(BLOCK_SIZE)
-
-    val tid = gpu_local_id_x()
-    # Each block processes 2 * BLOCK_SIZE elements
-    val global_idx = gpu_block_id_x() * (gpu_block_dim_x() * 2) + tid
-
-    # First add during load: load two elements and add them
-    var my_sum = 0.0f32
-    if global_idx < n:
-        my_sum = input[global_idx]
-    if global_idx + gpu_block_dim_x() < n:
-        my_sum = my_sum + input[global_idx + gpu_block_dim_x()]
-    shared[tid] = my_sum
-    gpu_syncthreads()
-
-    # Tree reduction with sequential addressing
-    var stride = gpu_block_dim_x() / 2
-    while stride > 32:
-        if tid < stride:
-            shared[tid] = shared[tid] + shared[tid + stride]
-        gpu_syncthreads()
-        stride = stride / 2
-
-    # Warp-synchronous reduction for the last warp (stride <= 32)
-    # All 32 threads in a warp execute in lockstep, so no sync needed.
-    # We still write to shared memory, but warp-level coherence ensures
-    # visibility within the warp.
-    if tid < 32:
-        if stride >= 32:
-            shared[tid] = shared[tid] + shared[tid + 32]
-        if stride >= 16:
-            shared[tid] = shared[tid] + shared[tid + 16]
-        if stride >= 8:
-            shared[tid] = shared[tid] + shared[tid + 8]
-        if stride >= 4:
-            shared[tid] = shared[tid] + shared[tid + 4]
-        if stride >= 2:
-            shared[tid] = shared[tid] + shared[tid + 2]
-        if stride >= 1:
-            shared[tid] = shared[tid] + shared[tid + 1]
-
-    # Thread 0 writes block result
-    if tid == 0:
-        gpu_atomic_add(output, 0, shared[0])
-
-# --------------------------------------------------------------------------
-# Host-side runners
-# --------------------------------------------------------------------------
-
-fn make_data(n: i32, fill: f32) -> List<f32>:
-    var data = List<f32>()
-    var i = 0
-    while i < n:
-        data.push(fill)
-        i = i + 1
-    data
-
-fn make_sequential(n: i32) -> List<f32>:
-    var data = List<f32>()
-    var i = 0
-    while i < n:
-        data.push(i * 1.0f32)
-        i = i + 1
-    data
-
-fn run_reduce_naive(data_host: List<f32>) -> Result<f32, GpuError>:
-    val n = data_host.len()
-    val data_dev = gpu_alloc<f32>(n)?
-    val result_dev = gpu_alloc<f32>(1)?
-
-    gpu_upload(data_dev, data_host)?
-    var zero = List<f32>()
-    zero.push(0.0f32)
-    gpu_upload(result_dev, zero)?
-
-    val grid_size = (n + BLOCK_SIZE - 1) / BLOCK_SIZE
-    reduce_naive<<<grid: (grid_size, 1, 1), block: (BLOCK_SIZE, 1, 1)>>>(
-        data_dev, result_dev, n
-    )
-
-    val result = gpu_download<f32>(result_dev, 1)?
-    gpu_free(data_dev)?
-    gpu_free(result_dev)?
-    Ok(result[0])
-
-fn run_reduce_sequential(data_host: List<f32>) -> Result<f32, GpuError>:
-    val n = data_host.len()
-    val data_dev = gpu_alloc<f32>(n)?
-    val result_dev = gpu_alloc<f32>(1)?
-
-    gpu_upload(data_dev, data_host)?
-    var zero = List<f32>()
-    zero.push(0.0f32)
-    gpu_upload(result_dev, zero)?
-
-    val grid_size = (n + BLOCK_SIZE - 1) / BLOCK_SIZE
-    reduce_sequential<<<grid: (grid_size, 1, 1), block: (BLOCK_SIZE, 1, 1)>>>(
-        data_dev, result_dev, n
-    )
-
-    val result = gpu_download<f32>(result_dev, 1)?
-    gpu_free(data_dev)?
-    gpu_free(result_dev)?
-    Ok(result[0])
-
-fn run_reduce_optimized(data_host: List<f32>) -> Result<f32, GpuError>:
-    val n = data_host.len()
-    val data_dev = gpu_alloc<f32>(n)?
-    val result_dev = gpu_alloc<f32>(1)?
-
-    gpu_upload(data_dev, data_host)?
-    var zero = List<f32>()
-    zero.push(0.0f32)
-    gpu_upload(result_dev, zero)?
-
-    # Each block handles 2 * BLOCK_SIZE elements, so we need half the blocks
-    val grid_size = (n + (BLOCK_SIZE * 2) - 1) / (BLOCK_SIZE * 2)
-    reduce_optimized<<<grid: (grid_size, 1, 1), block: (BLOCK_SIZE, 1, 1)>>>(
-        data_dev, result_dev, n
-    )
-
-    val result = gpu_download<f32>(result_dev, 1)?
-    gpu_free(data_dev)?
-    gpu_free(result_dev)?
-    Ok(result[0])
-
-# --------------------------------------------------------------------------
-# CPU reference
-# --------------------------------------------------------------------------
-
-fn cpu_sum(data: List<f32>) -> f32:
-    var total = 0.0f32
-    var i = 0
-    while i < data.len():
-        total = total + data[i]
-        i = i + 1
+fn cpu_sum(data: [f32]) -> f32:
+    var total: f32 = 0.0
+    for x in data:
+        total = total + x
     total
 
-# --------------------------------------------------------------------------
+# Run one reduction kernel: upload, launch `blocks` blocks, download the
+# per-block partials and add them on the host.
+fn run_reduction(module: i64, kernel: text, data: [f32], blocks: i64) -> Result<f32, text>:
+    val n = data.len()
+    if n == 0:
+        return Ok(0.0)
+    val input = gpu_upload_f32s(data)
+    val output = gpu_alloc_zeroed_words(blocks)
+    if input == 0 or output == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, kernel, blocks, BLOCK_SIZE, [input, output, n])
+    val partials = gpu_download_f32s(output, blocks)
+    gpu_free_ptr(input)
+    gpu_free_ptr(output)
+    if not ok or partials.len() != blocks:
+        return Err("{kernel} launch failed")
+    Ok(cpu_sum(partials))
+
+fn run_reduce_naive(module: i64, data: [f32]) -> Result<f32, text>:
+    run_reduction(module, "reduce_naive", data, grid_for(data.len(), BLOCK_SIZE))
+
+fn run_reduce_sequential(module: i64, data: [f32]) -> Result<f32, text>:
+    run_reduction(module, "reduce_sequential", data, grid_for(data.len(), BLOCK_SIZE))
+
+fn run_reduce_optimized(module: i64, data: [f32]) -> Result<f32, text>:
+    # each block consumes 2 * BLOCK_SIZE elements
+    run_reduction(module, "reduce_optimized", data, grid_for(data.len(), 2 * BLOCK_SIZE))
+
+# ----------------------------------------------------------------------------
 # Main
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-fn main() -> Result<i32, GpuError>:
-    val n = 4096
-    val ones = make_data(n, 1.0f32)
-    val expected_ones = cpu_sum(ones)
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        print "PTX module failed to load; nothing to run."
+        gpu_teardown(ctx)
+        return
 
-    print "=== Reduction of {n} ones (expected {expected_ones}) ==="
+    val n = 65536
+    val data = make_data(n, 1.0)
+    val expected = cpu_sum(data)
+    print "Reducing {n} elements (all 1.0), CPU reference = {expected}"
 
-    val r1 = run_reduce_naive(ones)?
-    print "  Naive:      {r1}"
+    print "=== reduce_naive (interleaved addressing) ==="
+    match run_reduce_naive(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
 
-    val r2 = run_reduce_sequential(ones)?
-    print "  Sequential: {r2}"
+    print "=== reduce_sequential (sequential addressing) ==="
+    match run_reduce_sequential(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
 
-    val r3 = run_reduce_optimized(ones)?
-    print "  Optimized:  {r3}"
+    print "=== reduce_optimized (first add during load) ==="
+    match run_reduce_optimized(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
 
-    print ""
+    print "=== sequential input 0..1023 (expected 523776.0) ==="
+    match run_reduce_optimized(module, make_sequential(1024)):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
 
-    # Sequential data: sum of 0..n-1 = n*(n-1)/2
-    val seq = make_sequential(n)
-    val expected_seq = cpu_sum(seq)
-    print "=== Reduction of 0..{n - 1} (expected {expected_seq}) ==="
-
-    val r4 = run_reduce_naive(seq)?
-    print "  Naive:      {r4}"
-
-    val r5 = run_reduce_sequential(seq)?
-    print "  Sequential: {r5}"
-
-    val r6 = run_reduce_optimized(seq)?
-    print "  Optimized:  {r6}"
-
-    print ""
-    print "All reduction variants complete."
-    Ok(0)
+    gpu_unload(module)
+    gpu_teardown(ctx)
+    print "All shared memory demos complete."

@@ -5,25 +5,59 @@
 
 ## Simple Approach
 
-Simple abstracts multi-GPU management through the `GpuDevice` API. Instead of raw
-CUDA device selection, you use `GpuDevice.get(id)` to obtain a device handle and
-execute kernels on specific devices.
+`std.cuda` exposes the driver API directly, so multi-GPU is one context per
+device rather than a device-selection switch:
 
-Key differences from CUDA:
-- **Device selection:** `GpuDevice.get(id)` returns a `Result<GpuDevice, GpuError>` instead of `cudaSetDevice()`
-- **Memory transfer:** `gpu_copy_peer(src_buf, dst_buf)` replaces `cudaMemcpyPeer()`
-- **Synchronization:** `device.sync()` replaces `cudaDeviceSynchronize()`
-- **Error handling:** `Result<T, GpuError>` with `?` operator instead of checking `cudaError_t`
+| CUDA | Simple (`std.cuda` + `../gpu_test_helpers.spl`) |
+|------|--------------------------------------------------|
+| `cudaSetDevice(i)` | `gpu_setup(i)` creates a context on device `i`; `rt_cuda_ctx_set_current(ctx)` switches back to it |
+| `cudaMalloc` / `cudaMemcpy` | `gpu_upload_f32s` / `gpu_download_f32s` in whichever context is current |
+| `kernel<<<...>>>` on device `i` | `gpu_run_1d(module, "add_kernel", ...)` with the module loaded in that context |
+| `cudaDeviceSynchronize()` | `cuda_sync()` (inside `gpu_run_1d`) |
+| `cudaMemcpyPeer` | **not available** -- `copy_between_devices` stages through the host |
+| `cudaError_t` checks | `Result<[f32], text>` |
+
+Modules are context-local: the PTX is loaded once per device. When only one
+device is present, `main.spl` says so and runs both halves on device 0.
 
 ## Concepts Covered
 
-- Enumerating available GPU devices
-- Allocating memory on specific devices
-- Cross-device memory copies
-- Running kernels on multiple devices in parallel
-- Synchronizing across devices
+- Enumerating available GPU devices (`cuda_device_count`, `cuda_device_name`)
+- One context per device, switching the current context
+- Splitting a vector add across two devices and merging the halves
+- Moving data between devices without peer access
+
+## Doctest: the split bookkeeping on the CPU
+
+Which half goes to which device, and what the merged result must be, is
+plain host arithmetic and runs without a GPU:
+
+```sdoctest
+>>> fn split_point(n: i64) -> i64:
+...     n / 2
+>>> fn add_half(a: [i64], b: [i64], from: i64, to: i64) -> [i64]:
+...     var out: [i64] = []
+...     for i in from..to:
+...         out.push(a[i] + b[i])
+...     out
+>>> val a = [1, 2, 3, 4, 5, 6, 7]
+>>> val b = [10, 20, 30, 40, 50, 60, 70]
+>>> val half = split_point(a.len())
+>>> print half
+3
+>>> val dev0 = add_half(a, b, 0, half)
+>>> val dev1 = add_half(a, b, half, a.len())
+>>> print dev0
+[11, 22, 33]
+>>> print dev1
+[44, 55, 66, 77]
+>>> assert half == 3 and dev0.len() + dev1.len() == 7 and dev1[3] == 77
+```
+
+(The `assert` keeps the block fail-closed: the seed's md doctest runner only
+checks that a block exits 0 and does not compare printed output.)
 
 ## Files
 
-- `main.spl` - Multi-GPU vector addition across two devices
-- `spec.spl` - Tests for multi-GPU operations
+- `main.spl` - Vector add split across two devices, plus a host-staged device-to-device copy
+- `spec.spl` - Host bookkeeping, one-device add, two-device split and copy (device tests skip without hardware)

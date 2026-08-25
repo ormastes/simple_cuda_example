@@ -70,3 +70,29 @@ kernel<<<grid: grid, block: block>>>(args)
 - Choose appropriate block and grid dimensions
 - Handle boundary conditions when data size is not a multiple of block size
 - Understand 1D vs 2D thread layouts
+
+## Run
+```bash
+bin/simple run examples/08_gpu/simple_cuda_example/10.cuda_basic/18.Thread_Hierarchy/main.spl
+bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/18.Thread_Hierarchy/spec.spl
+```
+
+## Try it (verified doctest)
+`cpu_kernel_run_1d(total, block_size, kernel)` executes a kernel-shaped
+function once per work-item on the CPU, driving `gpu_block_id_x()` /
+`gpu_local_id_x()` / `gpu_grid_dim_x()` exactly like a real launch, and
+returns how many items ran. 1000 elements in blocks of 256 run 1000 times
+across 4 blocks - the tail of the last block is skipped:
+
+```sdoctest
+>>> use std.gpu.*
+>>> fn probe():
+...     pass_dn
+>>> val ran = cpu_kernel_run_1d(1000, 256, probe)
+>>> print "{ran} work-items over {(1000 + 255) / 256} blocks"
+1000 work-items over 4 blocks
+>>> val stride_passes = (4096 + 1023) / 1024
+>>> print "grid-stride: 1024 threads cover 4096 elements in {stride_passes} passes"
+grid-stride: 1024 threads cover 4096 elements in 4 passes
+>>> if ran != 1000 or stride_passes != 4: panic("thread accounting drifted")
+```

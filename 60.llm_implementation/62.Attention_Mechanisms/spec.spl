@@ -1,69 +1,125 @@
-use std.gpu.{GpuDevice}
-use std.ml.{Tensor}
-use std.math.{abs}
+# 62. Attention Mechanisms - Tests
+#
+# CPU-reference checks for scaled dot-product attention: score scaling,
+# causal masking, row softmax, and the weighted sum. No assertion depends on
+# kernel output (a `<<<>>>` launch is a no-op on the Rust seed).
+
+use std.gpu.*
+
+fn attention_scores_cpu(q: [f32], k: [f32], seq_len: i64, d_k: i64) -> [f32]:
+    val scale = 1.0 / (d_k as f64).sqrt()
+    var scores: [f32] = []
+    for i in 0..seq_len:
+        for j in 0..seq_len:
+            var dot = 0.0
+            for d in 0..d_k:
+                dot = dot + (q[i * d_k + d] as f64) * (k[j * d_k + d] as f64)
+            scores.push((dot * scale) as f32)
+    scores
+
+fn causal_mask_cpu(scores: [f32], seq_len: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..seq_len:
+        for j in 0..seq_len:
+            if j > i:
+                out.push(-1.0e9)
+            else:
+                out.push(scores[i * seq_len + j])
+    out
+
+fn softmax_rows_cpu(scores: [f32], rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..rows:
+        var row_max = scores[i * cols] as f64
+        for j in 0..cols:
+            val v = scores[i * cols + j] as f64
+            if v > row_max:
+                row_max = v
+        var total = 0.0
+        var exps: [f64] = []
+        for j in 0..cols:
+            val e = ((scores[i * cols + j] as f64) - row_max).exp()
+            exps.push(e)
+            total = total + e
+        for j in 0..cols:
+            out.push((exps[j] / total) as f32)
+    out
+
+fn weighted_sum_cpu(weights: [f32], v: [f32], seq_len: i64, d_v: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..seq_len:
+        for d in 0..d_v:
+            var acc = 0.0
+            for j in 0..seq_len:
+                acc = acc + (weights[i * seq_len + j] as f64) * (v[j * d_v + d] as f64)
+            out.push(acc as f32)
+    out
+
+fn close(a: f32, b: f32) -> bool:
+    val d = a - b
+    val ad = if d < 0.0: 0.0 - d else: d
+    ad < 0.0001
 
 describe "Attention mechanisms":
-    it "should compute attention scores with correct shape":
-        val seq_len = 4
-        val d_k = 8
-        val q = Tensor.ones([seq_len, d_k])
-        val k = Tensor.ones([seq_len, d_k])
-        val v = Tensor.ones([seq_len, d_k])
-        val result = scaled_dot_product_attention(q, k, v, causal: false)?
-        expect(result.shape[0]).to_equal(seq_len)
-        expect(result.shape[1]).to_equal(d_k)
 
-    it "should produce softmax rows summing to 1":
-        val seq_len = 4
-        val d_k = 8
-        val q = Tensor.randn([seq_len, d_k])
-        val k = Tensor.randn([seq_len, d_k])
-        val v = Tensor.ones([seq_len, d_k])
-        val result = scaled_dot_product_attention(q, k, v, causal: false)?
-        # Each output row should be a weighted average of V rows
-        # Since all V rows are ones, output should be close to ones
-        var i = 0
-        while i < d_k:
-            val diff = abs(result.data[i] - 1.0)
-            expect(diff).to_be_less_than(0.01)
-            i = i + 1
+    describe "scores":
 
-    it "should apply causal mask":
-        val seq_len = 4
-        val d_k = 4
-        # With causal mask, position 0 can only attend to position 0
-        val q = Tensor.ones([seq_len, d_k])
-        val k = Tensor.ones([seq_len, d_k])
-        val v = Tensor(shape: [seq_len, d_k], data: [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0
-        ])
-        val result = scaled_dot_product_attention(q, k, v, causal: true)?
-        # Position 0 only attends to V[0], so output[0] = V[0] = [1,0,0,0]
-        expect(result.data[0]).to_equal(1.0)
-        expect(result.data[1]).to_equal(0.0)
+        it "scales the dot product by 1/sqrt(d_k)":
+            # q = k = [2, 0, 0, 0]; dot = 4; scale = 1/2
+            val q: [f32] = [2.0, 0.0, 0.0, 0.0]
+            val s = attention_scores_cpu(q, q, 1, 4)
+            expect(s.len()).to_equal(1)
+            expect(close(s[0], 2.0)).to_equal(true)
 
-    it "should handle multi-head attention":
-        val seq_len = 4
-        val d_model = 16
-        val num_heads = 4
-        val q = Tensor.randn([seq_len, d_model])
-        val k = Tensor.randn([seq_len, d_model])
-        val v = Tensor.randn([seq_len, d_model])
-        val result = multi_head_attention(q, k, v, num_heads, causal: false)?
-        expect(result.shape[0]).to_equal(seq_len)
-        expect(result.shape[1]).to_equal(d_model)
+        it "produces a seq x seq matrix":
+            val q: [f32] = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+            val s = attention_scores_cpu(q, q, 3, 2)
+            expect(s.len()).to_equal(9)
 
-    it "should scale by 1/sqrt(d_k)":
-        val seq_len = 2
-        val d_k = 64
-        val q = Tensor.ones([seq_len, d_k])
-        val k = Tensor.ones([seq_len, d_k])
-        val v = Tensor.ones([seq_len, d_k])
-        # With uniform Q,K all ones, scores = d_k / sqrt(d_k) = sqrt(d_k)
-        # After softmax, all weights equal -> output = V rows = ones
-        val result = scaled_dot_product_attention(q, k, v, causal: false)?
-        val diff = abs(result.data[0] - 1.0)
-        expect(diff).to_be_less_than(0.01)
+    describe "causal mask":
+
+        it "keeps the diagonal and past, blocks the future":
+            val s: [f32] = [1.0, 1.0, 1.0, 1.0]
+            val m = causal_mask_cpu(s, 2)
+            expect(close(m[0], 1.0)).to_equal(true)
+            expect(m[1] < -1.0e8).to_equal(true)
+            expect(close(m[2], 1.0)).to_equal(true)
+            expect(close(m[3], 1.0)).to_equal(true)
+
+    describe "softmax":
+
+        it "rows sum to one":
+            val s: [f32] = [1.0, 2.0, 3.0, -1.0, 0.0, 5.0]
+            val w = softmax_rows_cpu(s, 2, 3)
+            expect(close(w[0] + w[1] + w[2], 1.0)).to_equal(true)
+            expect(close(w[3] + w[4] + w[5], 1.0)).to_equal(true)
+
+        it "is uniform for equal scores":
+            val s: [f32] = [0.5, 0.5, 0.5, 0.5]
+            val w = softmax_rows_cpu(s, 1, 4)
+            expect(close(w[2], 0.25)).to_equal(true)
+
+        it "sends masked positions to zero weight":
+            val w = softmax_rows_cpu(causal_mask_cpu([0.0, 0.0, 0.0, 0.0], 2), 2, 2)
+            expect(close(w[0], 1.0)).to_equal(true)
+            expect(close(w[1], 0.0)).to_equal(true)
+            expect(close(w[2], 0.5)).to_equal(true)
+
+    describe "weighted sum":
+
+        it "selects a row when the weight is one-hot":
+            # both query rows attend only to value row 1 = [3, 4]
+            val w: [f32] = [0.0, 1.0, 0.0, 1.0]
+            val v: [f32] = [1.0, 2.0, 3.0, 4.0]
+            val out = weighted_sum_cpu(w, v, 2, 2)
+            expect(out.len()).to_equal(4)
+            expect(close(out[0], 3.0)).to_equal(true)
+            expect(close(out[1], 4.0)).to_equal(true)
+            expect(close(out[2], 3.0)).to_equal(true)
+
+    describe "launch geometry":
+
+        it "tiles a 100x100 score matrix with 16x16 blocks":
+            val grid = (100 + 15) / 16
+            expect(grid).to_equal(7)
+            expect(grid * 16 >= 100).to_equal(true)

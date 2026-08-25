@@ -1,308 +1,299 @@
 # Exercise 22: Streams and Async Operations
 #
-# Demonstrates multi-stream GPU processing:
-# - Creating and destroying streams
-# - Async uploads and downloads
-# - Kernel launches on specific streams
-# - Overlapping compute and transfer
+# The C++ original overlaps transfers and kernels on several CUDA streams.
+# The Rust seed's runtime has NO stream API at all (no rt_cuda_stream_* in
+# compiler_rust/runtime/src/cuda_runtime.rs, no `stream:` slot in the
+# `<<<grid:, block:>>>` grammar, no stream parameter on rt_cuda_launch_kernel),
+# so this module demonstrates what the seed CAN do honestly:
+#
+#   1. in-order execution on the default stream (launch, launch, ..., sync)
+#   2. chunked "pipeline" issue: all chunks enqueued back-to-back, ONE sync
+#   3. two independent producers feeding one consumer kernel
+#   4. CUDA events (rt_cuda_event_*), the one async primitive the seed has,
+#      used to time a launch on the default stream
+#
+# The missing stream slot is filed as a feature request:
+#   doc/08_tracking/bug/kernel_launch_grammar_no_stream_slot_2026-08-25.md
+# and the original multi-stream form is kept in README.md for reference.
 
-use std.gpu.{
-    gpu_alloc, gpu_alloc_pinned, gpu_upload, gpu_download, gpu_free,
-    gpu_upload_async, gpu_download_async,
-    gpu_stream_create, gpu_stream_destroy, gpu_stream_sync,
-    gpu_device_sync,
-    gpu_block_id_x, gpu_block_dim_x, gpu_local_id_x,
-    gpu_launch, GpuBuffer, GpuStream, GpuError
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_bytes, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_launch_1d, gpu_run_1d, gpu_sync_all, grid_for
 }
 
-# --------------------------------------------------------------------------
-# Kernel: scale each element (used across all demos)
-# --------------------------------------------------------------------------
+val BLOCK_SIZE = 256
 
-@gpu_kernel
-fn scale_kernel(data: GpuBuffer<f32>, scale: f32, n: i32):
-    val idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
-    if idx < n:
-        data[idx] = data[idx] * scale
+# CUDA events are available in the seed interpreter (dispatched in
+# compiler_rust/compiler/src/interpreter_extern/mod.rs); stream 0 = default.
+extern fn rt_cuda_event_create() -> i64
+extern fn rt_cuda_event_record(event: i64, stream: i64) -> i64
+extern fn rt_cuda_event_synchronize(event: i64) -> i64
+extern fn rt_cuda_event_elapsed_ns(start_event: i64, end_event: i64) -> i64
+extern fn rt_cuda_event_destroy(event: i64) -> i64
 
-# --------------------------------------------------------------------------
-# Kernel: element-wise add
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# PTX kernels
+# ----------------------------------------------------------------------------
+# scale_kernel(data, scale_bits, n): data[i] *= scale   (scale passed as the
+#   IEEE-754 bit pattern of an f32 in a .u64 slot)
+# add_kernel(a, b, c, n):            c[i] = a[i] + b[i]
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
 
-@gpu_kernel
-fn add_kernel(a: GpuBuffer<f32>, b: GpuBuffer<f32>, c: GpuBuffer<f32>, n: i32):
-    val idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
-    if idx < n:
-        c[idx] = a[idx] + b[idx]
+.visible .entry scale_kernel(.param .u64 data, .param .u64 scale_bits, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [scale_bits];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE;
+    cvt.u32.u64 %r5, %rd2;
+    mov.b32 %f1, %r5;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd6], %f3;
+DONE:
+    ret;
+}
 
-# --------------------------------------------------------------------------
-# Helper: create a list of f32
-# --------------------------------------------------------------------------
+.visible .entry add_kernel(.param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u64 %rd3, [c];
+    ld.param.u64 %rd4, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    add.u64 %rd8, %rd2, %rd6;
+    add.u64 %rd9, %rd3, %rd6;
+    ld.global.f32 %f1, [%rd7];
+    ld.global.f32 %f2, [%rd8];
+    add.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd9], %f3;
+DONE:
+    ret;
+}
+"""
 
-fn make_data(n: i32, val_fill: f32) -> List<f32>:
-    var data = List<f32>()
-    var i = 0
-    while i < n:
-        data.push(val_fill)
-        i = i + 1
-    data
+# ----------------------------------------------------------------------------
+# Host helpers
+# ----------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# Demo 1: Single stream -- basic async workflow
-#
-# Shows the minimal stream usage: create, async ops, sync, destroy.
-# --------------------------------------------------------------------------
+fn make_data(n: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(fill)
+    out
 
-fn demo_single_stream(n: i32) -> Result<List<f32>, GpuError>:
-    print "=== Demo 1: Single Stream ==="
+# IEEE-754 bits of an f32 so it can travel in a .u64 kernel parameter.
+fn scale_bits(x: f32) -> i64:
+    val v = x as f64
+    if v == 0.0:
+        return 0
+    var sign = 0
+    var a = v
+    if a < 0.0:
+        sign = 1
+        a = 0.0 - a
+    var e = 0
+    while a >= 2.0:
+        a = a / 2.0
+        e = e + 1
+    while a < 1.0:
+        a = a * 2.0
+        e = e - 1
+    val frac = ((a - 1.0) * 8388608.0 + 0.5) as i64
+    (sign << 31) | ((e + 127) << 23) | frac
 
-    val stream = gpu_stream_create()?
-    print "  Stream created"
+# Demo 1: one launch on the default stream, then sync, then download.
+fn demo_single_stream(module: i64, n: i64) -> Result<[f32], text>:
+    val dev = gpu_upload_f32s(make_data(n, 5.0))
+    if dev == 0:
+        return Err("upload failed")
+    val ok = gpu_run_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [dev, scale_bits(3.0), n])
+    val out = gpu_download_f32s(dev, n)
+    gpu_free_ptr(dev)
+    if not ok or out.len() != n:
+        return Err("scale launch failed")
+    Ok(out)
 
-    val dev_buf = gpu_alloc<f32>(n)?
-    val host_data = make_data(n, 5.0f32)
+# Demo 2: two independent buffers, both launches enqueued before a single sync.
+# On the default stream they execute in order; with real streams they could
+# overlap. Returns [buffer1 (x2), buffer2 (x4)] concatenated.
+fn demo_two_streams(module: i64, n: i64) -> Result<[f32], text>:
+    val d1 = gpu_upload_f32s(make_data(n, 1.0))
+    val d2 = gpu_upload_f32s(make_data(n, 1.0))
+    if d1 == 0 or d2 == 0:
+        return Err("upload failed")
+    val rc1 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [d1, scale_bits(2.0), n])
+    val rc2 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [d2, scale_bits(4.0), n])
+    val synced = gpu_sync_all()
+    var out = gpu_download_f32s(d1, n)
+    val second = gpu_download_f32s(d2, n)
+    gpu_free_ptr(d1)
+    gpu_free_ptr(d2)
+    if rc1 != 0 or rc2 != 0 or not synced or out.len() != n or second.len() != n:
+        return Err("two-buffer launch failed")
+    for x in second:
+        out.push(x)
+    Ok(out)
 
-    # Async upload on the stream
-    gpu_upload_async(dev_buf, host_data, stream)?
-    print "  Async upload enqueued"
+# Demo 3: chunked pipeline. `total` elements are processed as `num_chunks`
+# back-to-back launches over sub-ranges of ONE device buffer (pointer
+# arithmetic: chunk k starts at dev + k*chunk*4), then a single sync.
+fn demo_pipeline(module: i64, total: i64, num_chunks: i64) -> Result<[f32], text>:
+    if num_chunks <= 0 or total % num_chunks != 0:
+        return Err("total must be a multiple of num_chunks")
+    val chunk = total / num_chunks
+    val dev = gpu_upload_f32s(make_data(total, 1.0))
+    if dev == 0:
+        return Err("upload failed")
+    var all_ok = true
+    for k in 0..num_chunks:
+        # chunk k is scaled by (k + 1) so the result reveals chunk boundaries
+        val rc = gpu_launch_1d(module, "scale_kernel", grid_for(chunk, BLOCK_SIZE), BLOCK_SIZE,
+                               [dev + k * chunk * 4, scale_bits((k + 1) as f32), chunk])
+        if rc != 0:
+            all_ok = false
+    val synced = gpu_sync_all()
+    val out = gpu_download_f32s(dev, total)
+    gpu_free_ptr(dev)
+    if not all_ok or not synced or out.len() != total:
+        return Err("pipeline launch failed")
+    Ok(out)
 
-    # Launch kernel on the stream
-    val block_size = 256
-    val grid_size = (n + block_size - 1) / block_size
-    scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: stream>>>(
-        dev_buf, 3.0f32, n
-    )
-    print "  Kernel enqueued (scale by 3.0)"
+# Demo 4: two producers (scale a by 2, scale b by 3) then one consumer
+# (c = a + b). In-order default-stream semantics guarantee the consumer sees
+# both producers' results.
+fn demo_stream_add(module: i64, n: i64) -> Result<[f32], text>:
+    val a = gpu_upload_f32s(make_data(n, 1.0))
+    val b = gpu_upload_f32s(make_data(n, 1.0))
+    val c = gpu_alloc_bytes(n * 4)
+    if a == 0 or b == 0 or c == 0:
+        return Err("alloc failed")
+    val rc1 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [a, scale_bits(2.0), n])
+    val rc2 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [b, scale_bits(3.0), n])
+    val rc3 = gpu_launch_1d(module, "add_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [a, b, c, n])
+    val synced = gpu_sync_all()
+    val out = gpu_download_f32s(c, n)
+    gpu_free_ptr(a)
+    gpu_free_ptr(b)
+    gpu_free_ptr(c)
+    if rc1 != 0 or rc2 != 0 or rc3 != 0 or not synced or out.len() != n:
+        return Err("producer/consumer launch failed")
+    Ok(out)
 
-    # Async download on the stream
-    val result = gpu_download_async<f32>(dev_buf, n, stream)?
-    print "  Async download enqueued"
+# Demo 5: time one launch with CUDA events on the default stream (stream 0).
+# Returns elapsed nanoseconds (>= 0) or Err when events are unavailable.
+fn demo_event_timing(module: i64, n: i64) -> Result<i64, text>:
+    val dev = gpu_upload_f32s(make_data(n, 1.0))
+    if dev == 0:
+        return Err("upload failed")
+    val start = rt_cuda_event_create()
+    val stop = rt_cuda_event_create()
+    if start <= 0 or stop <= 0:
+        gpu_free_ptr(dev)
+        return Err("event create failed")
+    rt_cuda_event_record(start, 0)
+    val rc = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [dev, scale_bits(2.0), n])
+    rt_cuda_event_record(stop, 0)
+    rt_cuda_event_synchronize(stop)
+    val ns = rt_cuda_event_elapsed_ns(start, stop)
+    rt_cuda_event_destroy(start)
+    rt_cuda_event_destroy(stop)
+    gpu_free_ptr(dev)
+    if rc != 0 or ns < 0:
+        return Err("event timing failed")
+    Ok(ns)
 
-    # Wait for everything on this stream to complete
-    gpu_stream_sync(stream)?
-    print "  Stream synchronized"
+fn count_equal(xs: [f32], expected: f32) -> i64:
+    var c = 0
+    for x in xs:
+        val d = x - expected
+        if d < 0.0001 and d > -0.0001:
+            c = c + 1
+    c
 
-    gpu_free(dev_buf)?
-    gpu_stream_destroy(stream)?
-    print "  Stream destroyed"
-
-    Ok(result)
-
-# --------------------------------------------------------------------------
-# Demo 2: Two independent streams -- overlap compute and transfer
-#
-# Stream 1 processes chunk A while stream 2 uploads chunk B.
-# This is the fundamental overlap pattern.
-# --------------------------------------------------------------------------
-
-fn demo_two_streams(n: i32) -> Result<List<f32>, GpuError>:
-    print "=== Demo 2: Two Streams (Overlap) ==="
-
-    val stream1 = gpu_stream_create()?
-    val stream2 = gpu_stream_create()?
-
-    val half = n / 2
-    val block_size = 256
-    val grid_size = (half + block_size - 1) / block_size
-
-    # Allocate two device buffers
-    val dev_a = gpu_alloc<f32>(half)?
-    val dev_b = gpu_alloc<f32>(half)?
-
-    val data_a = make_data(half, 2.0f32)
-    val data_b = make_data(half, 4.0f32)
-
-    # Stream 1: upload A, compute A
-    gpu_upload_async(dev_a, data_a, stream1)?
-    scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: stream1>>>(
-        dev_a, 10.0f32, half
-    )
-
-    # Stream 2: upload B, compute B (can overlap with stream 1)
-    gpu_upload_async(dev_b, data_b, stream2)?
-    scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: stream2>>>(
-        dev_b, 10.0f32, half
-    )
-
-    # Download results (each on its own stream)
-    val result_a = gpu_download_async<f32>(dev_a, half, stream1)?
-    val result_b = gpu_download_async<f32>(dev_b, half, stream2)?
-
-    # Sync both streams
-    gpu_stream_sync(stream1)?
-    gpu_stream_sync(stream2)?
-    print "  Both streams complete"
-
-    gpu_free(dev_a)?
-    gpu_free(dev_b)?
-    gpu_stream_destroy(stream1)?
-    gpu_stream_destroy(stream2)?
-
-    # Combine results
-    var combined = List<f32>()
-    var i = 0
-    while i < half:
-        combined.push(result_a[i])
-        i = i + 1
-    i = 0
-    while i < half:
-        combined.push(result_b[i])
-        i = i + 1
-
-    Ok(combined)
-
-# --------------------------------------------------------------------------
-# Demo 3: Pipeline with multiple streams
-#
-# Process data in chunks, each on its own stream, creating a pipeline
-# where upload/compute/download of different chunks overlap.
-# --------------------------------------------------------------------------
-
-fn demo_pipeline(total: i32, num_streams: i32) -> Result<List<f32>, GpuError>:
-    print "=== Demo 3: Pipeline ({num_streams} streams) ==="
-
-    val chunk_size = total / num_streams
-    val block_size = 256
-    val grid_size = (chunk_size + block_size - 1) / block_size
-
-    # Create streams and buffers
-    var streams = List<GpuStream>()
-    var dev_bufs = List<GpuBuffer<f32>>()
-
-    var s = 0
-    while s < num_streams:
-        val stream = gpu_stream_create()?
-        streams.push(stream)
-        val buf = gpu_alloc<f32>(chunk_size)?
-        dev_bufs.push(buf)
-        s = s + 1
-
-    # Enqueue all work across streams
-    s = 0
-    while s < num_streams:
-        val data = make_data(chunk_size, (s + 1) * 1.0f32)
-        gpu_upload_async(dev_bufs[s], data, streams[s])?
-        scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: streams[s]>>>(
-            dev_bufs[s], 2.0f32, chunk_size
-        )
-        s = s + 1
-    print "  All chunks enqueued"
-
-    # Download all results
-    var results = List<List<f32>>()
-    s = 0
-    while s < num_streams:
-        val chunk_result = gpu_download_async<f32>(dev_bufs[s], chunk_size, streams[s])?
-        results.push(chunk_result)
-        s = s + 1
-
-    # Sync all streams
-    gpu_device_sync()?
-    print "  All streams synchronized via device_sync"
-
-    # Cleanup
-    s = 0
-    while s < num_streams:
-        gpu_free(dev_bufs[s])?
-        gpu_stream_destroy(streams[s])?
-        s = s + 1
-
-    # Flatten results
-    var combined = List<f32>()
-    s = 0
-    while s < num_streams:
-        var i = 0
-        while i < chunk_size:
-            combined.push(results[s][i])
-            i = i + 1
-        s = s + 1
-
-    Ok(combined)
-
-# --------------------------------------------------------------------------
-# Demo 4: Two-stream add -- streams feed into a combined operation
-#
-# Stream 1 prepares buffer A, stream 2 prepares buffer B, then we
-# sync both and launch the add kernel on the default stream.
-# --------------------------------------------------------------------------
-
-fn demo_stream_add(n: i32) -> Result<List<f32>, GpuError>:
-    print "=== Demo 4: Stream-Based Add ==="
-
-    val stream1 = gpu_stream_create()?
-    val stream2 = gpu_stream_create()?
-
-    val dev_a = gpu_alloc<f32>(n)?
-    val dev_b = gpu_alloc<f32>(n)?
-    val dev_c = gpu_alloc<f32>(n)?
-
-    val data_a = make_data(n, 3.0f32)
-    val data_b = make_data(n, 7.0f32)
-
-    val block_size = 256
-    val grid_size = (n + block_size - 1) / block_size
-
-    # Prepare A on stream 1: upload then scale by 2 -> 6.0
-    gpu_upload_async(dev_a, data_a, stream1)?
-    scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: stream1>>>(
-        dev_a, 2.0f32, n
-    )
-
-    # Prepare B on stream 2: upload then scale by 3 -> 21.0
-    gpu_upload_async(dev_b, data_b, stream2)?
-    scale_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1), stream: stream2>>>(
-        dev_b, 3.0f32, n
-    )
-
-    # Sync both streams before combining
-    gpu_stream_sync(stream1)?
-    gpu_stream_sync(stream2)?
-    print "  Both preparation streams done"
-
-    # Add on default stream (no stream parameter)
-    add_kernel<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1)>>>(
-        dev_a, dev_b, dev_c, n
-    )
-
-    val result = gpu_download<f32>(dev_c, n)?
-
-    gpu_free(dev_a)?
-    gpu_free(dev_b)?
-    gpu_free(dev_c)?
-    gpu_stream_destroy(stream1)?
-    gpu_stream_destroy(stream2)?
-
-    Ok(result)
-
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Main
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-fn main() -> Result<i32, GpuError>:
-    val n = 4096
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        gpu_teardown(ctx)
+        return
+    val n = 1024
 
-    val r1 = demo_single_stream(n)?
-    print "  r1[0] = {r1[0]} (expected 15.0)"
+    print "=== Default stream: scale 5.0 x 3.0 ==="
+    match demo_single_stream(module, n):
+        case Ok(r):
+            print "  {count_equal(r, 15.0)}/{n} elements equal 15.0"
+        case Err(e):
+            print "  error: {e}"
 
-    print ""
+    print "=== Two buffers, two launches, one sync ==="
+    match demo_two_streams(module, n):
+        case Ok(r):
+            var first: [f32] = []
+            var second: [f32] = []
+            for i in 0..n:
+                first.push(r[i])
+                second.push(r[n + i])
+            print "  buffer1: {count_equal(first, 2.0)}/{n} equal 2.0, buffer2: {count_equal(second, 4.0)}/{n} equal 4.0"
+        case Err(e):
+            print "  error: {e}"
 
-    val r2 = demo_two_streams(n)?
-    print "  r2[0] = {r2[0]} (expected 20.0), r2[{n / 2}] = {r2[n / 2]} (expected 40.0)"
+    print "=== Chunked pipeline: 4 chunks scaled by 1,2,3,4 ==="
+    match demo_pipeline(module, n, 4):
+        case Ok(r):
+            print "  chunk0[0]={r[0]} chunk1[0]={r[256]} chunk2[0]={r[512]} chunk3[0]={r[768]} (expected 1.0 2.0 3.0 4.0)"
+        case Err(e):
+            print "  error: {e}"
 
-    print ""
+    print "=== Producer/consumer: (1x2) + (1x3) ==="
+    match demo_stream_add(module, n):
+        case Ok(r):
+            print "  {count_equal(r, 5.0)}/{n} elements equal 5.0"
+        case Err(e):
+            print "  error: {e}"
 
-    val r3 = demo_pipeline(n, 4)?
-    val chunk = n / 4
-    print "  r3[0] = {r3[0]} (expected 2.0)"
-    print "  r3[{chunk}] = {r3[chunk]} (expected 4.0)"
-    print "  r3[{chunk * 2}] = {r3[chunk * 2]} (expected 6.0)"
-    print "  r3[{chunk * 3}] = {r3[chunk * 3]} (expected 8.0)"
+    print "=== Event timing on the default stream ==="
+    match demo_event_timing(module, n):
+        case Ok(ns):
+            print "  scale_kernel timed with cuEvent: elapsed >= 0 ns -> {ns >= 0}"
+        case Err(e):
+            print "  error: {e}"
 
-    print ""
-
-    val r4 = demo_stream_add(n)?
-    print "  r4[0] = {r4[0]} (expected 27.0: 3*2 + 7*3)"
-
-    print ""
+    gpu_unload(module)
+    gpu_teardown(ctx)
     print "All stream demos complete."
-    Ok(0)
