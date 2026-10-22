@@ -26,7 +26,7 @@ if (err != cudaSuccess) {
 ```
 
 ### Simple - Result + ? operator
-```simple
+```text
 fn upload_data(data: [f32]) -> Result<GpuPtr, GpuError>:
     val d_a = gpu_alloc(data.len() * 4)?     # ? propagates on error
     gpu_upload_f32(d_a, data)?                # ? propagates on error
@@ -41,6 +41,19 @@ fn upload_data(data: [f32]) -> Result<GpuPtr, GpuError>:
 | `match result:`        | Handle Ok/Err explicitly                       |
 | `result ?? default`    | Provide fallback value on error                |
 | `Result<T, GpuError>`  | Return type for fallible GPU functions          |
+
+Result propagation works the same way on plain host functions:
+
+```sdoctest
+>>> fn upload_size(n: i64) -> Result<i64, text>:
+...     if n < 0:
+...         return Err("negative size")
+...     Ok(n * 4)
+>>> match upload_size(-1):
+...     case Ok(v): print "ok {v}"
+...     case Err(e): print "caught: {e}"
+caught: negative size
+```
 
 ## Run
 ```bash

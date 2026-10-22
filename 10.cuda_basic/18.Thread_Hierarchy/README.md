@@ -33,14 +33,14 @@ Grid (all blocks)
 
 ### Global Thread ID Calculation
 
-```simple
+```text
 val global_x = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
 val global_y = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
 ```
 
 ### Launch Configuration
 
-```simple
+```text
 # 1D launch: N elements with 256 threads per block
 val block = (256, 1, 1)
 val grid = ((n + 255) / 256, 1, 1)
@@ -58,6 +58,14 @@ kernel<<<grid: grid, block: block>>>(args)
 - Common choices: 128, 256, 512 threads per block
 - Max 1024 threads per block on most hardware
 - 2D blocks: 16x16=256 or 32x32=1024
+
+Grid sizing for a 1D launch is plain host arithmetic:
+
+```sdoctest
+>>> val n = 1000
+>>> (n + 255) / 256
+4
+```
 
 ## Files
 

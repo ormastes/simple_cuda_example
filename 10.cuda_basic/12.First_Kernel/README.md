@@ -32,7 +32,7 @@ cudaDeviceSynchronize();
 cudaMemcpy(h_c, d_c, n * sizeof(float), cudaMemcpyDeviceToHost);
 ```
 
-```simple
+```text
 # Simple
 @gpu_device
 fn flat_index() -> i64:
@@ -57,6 +57,16 @@ val gy = (height + by - 1) / by
 vector_add<<<grid: (gx, gy, 1), block: (bx, by, 1)>>>(d_a, d_b, d_c, n)
 gpu_sync()?
 gpu_download(d_c, host_c_ptr, n * 4)?
+```
+
+Host-side launch math is deterministic, so it can be checked without a device:
+
+```sdoctest
+>>> use std.gc_async_mut.gpu_ops.{cpu_kernel_run_1d}
+>>> fn noop():
+...     pass_dn
+>>> print "{cpu_kernel_run_1d(256, 128, noop)} threads for a 256-element launch"
+256 threads for a 256-element launch
 ```
 
 ## Run

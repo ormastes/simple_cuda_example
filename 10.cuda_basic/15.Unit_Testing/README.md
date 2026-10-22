@@ -29,7 +29,7 @@ work identically for host and device code.
 
 ### GPU-specific patterns
 
-```simple
+```text
 # Pattern: tolerance comparison for floating-point results
 fn close_enough(actual: f32, expected: f32, tol: f32) -> bool:
     val diff = actual - expected
@@ -39,6 +39,17 @@ fn close_enough(actual: f32, expected: f32, tol: f32) -> bool:
 it "kernel produces correct results":
     # ... launch kernel, download result ...
     expect(close_enough(result, 42.0, 0.001)).to_equal(true)
+```
+
+The tolerance helper itself is plain host code, so it can be doctested directly:
+
+```sdoctest
+>>> fn close_enough(actual: f32, expected: f32, tol: f32) -> bool:
+...     val diff = actual - expected
+...     val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+...     abs_diff <= tol
+>>> close_enough(41.9995, 42.0, 0.001)
+true
 ```
 
 ## Run
